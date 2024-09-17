@@ -1,0 +1,7 @@
+servers:
+  - address: "p1.bxy-fun2.xyz:24103"
+    cipher: "CHACHA20-IETF-POLY1305"
+    password: "999f126b-96db-4fa5-9e2c-4f0c1f89adcd"
+  - address: "p2.example.com:12345"
+    cipher: "AES-256-GCM"
+    password: "another-password"
