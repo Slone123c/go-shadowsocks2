@@ -7,15 +7,19 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
+	"net"
 	"net/url"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/shadowsocks/go-shadowsocks2/core"
 	"github.com/shadowsocks/go-shadowsocks2/socks"
+	"github.com/spf13/viper"
 )
 
 var config struct {
@@ -149,22 +153,28 @@ func main() {
 	}
 
 	if flags.Server != "" { // server mode
-		addr := flags.Server
-		cipher := flags.Cipher
-		password := flags.Password
-		if flags.Password == "" {
-			password = os.Getenv("SS_PASSWORD")
-		}
-		var err error
-
-		if strings.HasPrefix(addr, "ss://") {
-			addr, cipher, password, err = parseURL(addr)
-			if err != nil {
-				log.Fatal(err)
-			}
+		// 使用 Viper 读取配置
+		var cfg Config
+		viper.SetConfigName("config")    // 配置文件名称（不包括扩展）
+		viper.SetConfigType("yaml")      // 配置文件类型
+		viper.AddConfigPath("./config")  // 查找配置文件的路径
+		err := viper.ReadInConfig()      // 读取配置文件
+		if err != nil {
+			log.Fatalf("Error reading config file: %s", err)
 		}
 
-		udpAddr := addr
+		err = viper.Unmarshal(&cfg)
+		if err != nil {
+			log.Fatalf("Unable to decode into struct: %v", err)
+		}
+		var addr, cipher, password string
+		// 使用配置文件中的第一个服务器配置
+		if len(cfg.Servers) > 0 {
+			serverConfig := cfg.Servers[0]
+			addr = serverConfig.Address
+			cipher = serverConfig.Cipher
+			password = serverConfig.Password
+		}
 
 		if flags.Plugin != "" {
 			addr, err = startPlugin(flags.Plugin, flags.PluginOpts, addr, true)
@@ -179,11 +189,38 @@ func main() {
 		}
 
 		if flags.UDP {
-			go udpRemote(udpAddr, ciph.PacketConn)
+			go udpRemote(addr, ciph.PacketConn)
 		}
 		if flags.TCP {
 			go tcpRemote(addr, ciph.StreamConn)
 		}
+
+		// 初始化服务器列表
+		for _, cfg := range cfg.Servers {
+			serverList = append(serverList, ServerInfo{Config: cfg})
+		}
+
+		// 初始检查所有服务器延迟
+		for i := range serverList {
+			checkServerLatency(&serverList[i])
+		}
+
+		// 选择初始最佳服务器
+		currentServer = selectBestServer()
+
+		// 启动定期检查
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			for range ticker.C {
+				for i := range serverList {
+					checkServerLatency(&serverList[i])
+				}
+				serverMutex.Lock()
+				currentServer = selectBestServer()
+				serverMutex.Unlock()
+			}
+		}()
+
 	}
 
 	sigCh := make(chan os.Signal, 1)
@@ -204,4 +241,41 @@ func parseURL(s string) (addr, cipher, password string, err error) {
 		password, _ = u.User.Password()
 	}
 	return
+}
+
+type ServerInfo struct {
+	Config ServerConfig
+	Latency time.Duration
+	LastCheck time.Time
+}
+
+var (
+	serverList []ServerInfo
+	currentServer *ServerInfo
+	serverMutex sync.RWMutex
+)
+
+func checkServerLatency(server *ServerInfo) {
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", server.Config.Address, 5*time.Second)
+	if err != nil {
+		server.Latency = time.Duration(math.MaxInt64)
+		return
+	}
+	defer conn.Close()
+	server.Latency = time.Since(start)
+	server.LastCheck = time.Now()
+}
+
+func selectBestServer() *ServerInfo {
+	serverMutex.RLock()
+	defer serverMutex.RUnlock()
+
+	var bestServer *ServerInfo
+	for i := range serverList {
+		if bestServer == nil || serverList[i].Latency < bestServer.Latency {
+			bestServer = &serverList[i]
+		}
+	}
+	return bestServer
 }

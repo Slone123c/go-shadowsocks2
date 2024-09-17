@@ -1,0 +1,2233 @@
+PATH: `./log.go`
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+)
+
+var logger = log.New(os.Stderr, "", log.Lshortfile|log.LstdFlags)
+
+func logf(f string, v ...interface{}) {
+	if config.Verbose {
+		logger.Output(2, fmt.Sprintf(f, v...))
+	}
+}
+
+type logHelper struct {
+	prefix string
+}
+
+func (l *logHelper) Write(p []byte) (n int, err error) {
+	if config.Verbose {
+		logger.Printf("%s%s\n", l.prefix, p)
+		return len(p), nil
+	}
+	return len(p), nil
+}
+
+func newLogHelper(prefix string) *logHelper {
+	return &logHelper{prefix}
+}
+```
+
+PATH: `./tcp_linux.go`
+```go
+package main
+
+import (
+	"net"
+
+	"github.com/shadowsocks/go-shadowsocks2/nfutil"
+	"github.com/shadowsocks/go-shadowsocks2/socks"
+)
+
+func getOrigDst(c net.Conn, ipv6 bool) (socks.Addr, error) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		addr, err := nfutil.GetOrigDst(tc, ipv6)
+		return socks.ParseAddr(addr.String()), err
+	}
+	panic("not a TCP connection")
+}
+
+// Listen on addr for netfilter redirected TCP connections
+func redirLocal(addr, server string, shadow func(net.Conn) net.Conn) {
+	logf("TCP redirect %s <-> %s", addr, server)
+	tcpLocal(addr, server, shadow, func(c net.Conn) (socks.Addr, error) { return getOrigDst(c, false) })
+}
+
+// Listen on addr for netfilter redirected TCP IPv6 connections.
+func redir6Local(addr, server string, shadow func(net.Conn) net.Conn) {
+	logf("TCP6 redirect %s <-> %s", addr, server)
+	tcpLocal(addr, server, shadow, func(c net.Conn) (socks.Addr, error) { return getOrigDst(c, true) })
+}
+```
+
+PATH: `./core/stream.go`
+```go
+package core
+
+import "net"
+
+type listener struct {
+	net.Listener
+	StreamConnCipher
+}
+
+func Listen(network, address string, ciph StreamConnCipher) (net.Listener, error) {
+	l, err := net.Listen(network, address)
+	return &listener{l, ciph}, err
+}
+
+func (l *listener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	return l.StreamConn(c), err
+}
+
+func Dial(network, address string, ciph StreamConnCipher) (net.Conn, error) {
+	c, err := net.Dial(network, address)
+	return ciph.StreamConn(c), err
+}
+```
+
+PATH: `./core/packet.go`
+```go
+package core
+
+import "net"
+
+func ListenPacket(network, address string, ciph PacketConnCipher) (net.PacketConn, error) {
+	c, err := net.ListenPacket(network, address)
+	return ciph.PacketConn(c), err
+}
+```
+
+PATH: `./core/doc.go`
+```go
+// Package core implements essential parts of Shadowsocks
+package core
+```
+
+PATH: `./core/cipher.go`
+```go
+package core
+
+import (
+	"crypto/md5"
+	"errors"
+	"net"
+	"sort"
+	"strings"
+
+	"github.com/shadowsocks/go-shadowsocks2/shadowaead"
+)
+
+type Cipher interface {
+	StreamConnCipher
+	PacketConnCipher
+}
+
+type StreamConnCipher interface {
+	StreamConn(net.Conn) net.Conn
+}
+
+type PacketConnCipher interface {
+	PacketConn(net.PacketConn) net.PacketConn
+}
+
+// ErrCipherNotSupported occurs when a cipher is not supported (likely because of security concerns).
+var ErrCipherNotSupported = errors.New("cipher not supported")
+
+const (
+	aeadAes128Gcm        = "AEAD_AES_128_GCM"
+	aeadAes256Gcm        = "AEAD_AES_256_GCM"
+	aeadChacha20Poly1305 = "AEAD_CHACHA20_POLY1305"
+)
+
+// List of AEAD ciphers: key size in bytes and constructor
+var aeadList = map[string]struct {
+	KeySize int
+	New     func([]byte) (shadowaead.Cipher, error)
+}{
+	aeadAes128Gcm:        {16, shadowaead.AESGCM},
+	aeadAes256Gcm:        {32, shadowaead.AESGCM},
+	aeadChacha20Poly1305: {32, shadowaead.Chacha20Poly1305},
+}
+
+// ListCipher returns a list of available cipher names sorted alphabetically.
+func ListCipher() []string {
+	var l []string
+	for k := range aeadList {
+		l = append(l, k)
+	}
+	sort.Strings(l)
+	return l
+}
+
+// PickCipher returns a Cipher of the given name. Derive key from password if given key is empty.
+func PickCipher(name string, key []byte, password string) (Cipher, error) {
+	name = strings.ToUpper(name)
+
+	switch name {
+	case "DUMMY":
+		return &dummy{}, nil
+	case "CHACHA20-IETF-POLY1305":
+		name = aeadChacha20Poly1305
+	case "AES-128-GCM":
+		name = aeadAes128Gcm
+	case "AES-256-GCM":
+		name = aeadAes256Gcm
+	}
+
+	if choice, ok := aeadList[name]; ok {
+		if len(key) == 0 {
+			key = kdf(password, choice.KeySize)
+		}
+		if len(key) != choice.KeySize {
+			return nil, shadowaead.KeySizeError(choice.KeySize)
+		}
+		aead, err := choice.New(key)
+		return &aeadCipher{aead}, err
+	}
+
+	return nil, ErrCipherNotSupported
+}
+
+type aeadCipher struct{ shadowaead.Cipher }
+
+func (aead *aeadCipher) StreamConn(c net.Conn) net.Conn { return shadowaead.NewConn(c, aead) }
+func (aead *aeadCipher) PacketConn(c net.PacketConn) net.PacketConn {
+	return shadowaead.NewPacketConn(c, aead)
+}
+
+// dummy cipher does not encrypt
+type dummy struct{}
+
+func (dummy) StreamConn(c net.Conn) net.Conn             { return c }
+func (dummy) PacketConn(c net.PacketConn) net.PacketConn { return c }
+
+// key-derivation function from original Shadowsocks
+func kdf(password string, keyLen int) []byte {
+	var b, prev []byte
+	h := md5.New()
+	for len(b) < keyLen {
+		h.Write(prev)
+		h.Write([]byte(password))
+		b = h.Sum(b)
+		prev = b[len(b)-h.Size():]
+		h.Reset()
+	}
+	return b[:keyLen]
+}
+```
+
+PATH: `./tcp_darwin.go`
+```go
+package main
+
+import (
+	"net"
+
+	"github.com/shadowsocks/go-shadowsocks2/pfutil"
+	"github.com/shadowsocks/go-shadowsocks2/socks"
+)
+
+func redirLocal(addr, server string, shadow func(net.Conn) net.Conn) {
+	tcpLocal(addr, server, shadow, natLookup)
+}
+
+func redir6Local(addr, server string, shadow func(net.Conn) net.Conn) {
+	panic("TCP6 redirect not supported")
+}
+
+func natLookup(c net.Conn) (socks.Addr, error) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		addr, err := pfutil.NatLookup(tc)
+		return socks.ParseAddr(addr.String()), err
+	}
+	panic("not TCP connection")
+}
+```
+
+PATH: `./internal/bloomring_test.go`
+```go
+package internal_test
+
+import (
+	"fmt"
+	"os"
+	"testing"
+
+	"github.com/shadowsocks/go-shadowsocks2/internal"
+)
+
+var (
+	bloomRingInstance *internal.BloomRing
+)
+
+func TestMain(m *testing.M) {
+	bloomRingInstance = internal.NewBloomRing(internal.DefaultSFSlot, int(internal.DefaultSFCapacity),
+		internal.DefaultSFFPR)
+	os.Exit(m.Run())
+}
+
+func TestBloomRing_Add(t *testing.T) {
+	defer func() {
+		if any := recover(); any != nil {
+			t.Fatalf("Should not got panic while adding item: %v", any)
+		}
+	}()
+	bloomRingInstance.Add(make([]byte, 16))
+}
+
+func TestBloomRing_NilAdd(t *testing.T) {
+	defer func() {
+		if any := recover(); any != nil {
+			t.Fatalf("Should not got panic while adding item: %v", any)
+		}
+	}()
+	var nilRing *internal.BloomRing
+	nilRing.Add(make([]byte, 16))
+}
+
+func TestBloomRing_Test(t *testing.T) {
+	buf := []byte("shadowsocks")
+	bloomRingInstance.Add(buf)
+	if !bloomRingInstance.Test(buf) {
+		t.Fatal("Test on filter missing")
+	}
+}
+
+func TestBloomRing_NilTestIsFalse(t *testing.T) {
+	var nilRing *internal.BloomRing
+	if nilRing.Test([]byte("shadowsocks")) {
+		t.Fatal("Test should return false for nil BloomRing")
+	}
+}
+
+func BenchmarkBloomRing(b *testing.B) {
+	// Generate test samples with different length
+	samples := make([][]byte, internal.DefaultSFCapacity-internal.DefaultSFSlot)
+	var checkPoints [][]byte
+	for i := 0; i < len(samples); i++ {
+		samples[i] = []byte(fmt.Sprint(i))
+		if i%1000 == 0 {
+			checkPoints = append(checkPoints, samples[i])
+		}
+	}
+	b.Logf("Generated %d samples and %d check points", len(samples), len(checkPoints))
+	for i := 1; i < 16; i++ {
+		b.Run(fmt.Sprintf("Slot%d", i), benchmarkBloomRing(samples, checkPoints, i))
+	}
+}
+
+func benchmarkBloomRing(samples, checkPoints [][]byte, slot int) func(*testing.B) {
+	filter := internal.NewBloomRing(slot, int(internal.DefaultSFCapacity), internal.DefaultSFFPR)
+	for _, sample := range samples {
+		filter.Add(sample)
+	}
+	return func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			for _, cp := range checkPoints {
+				filter.Test(cp)
+			}
+		}
+	}
+}
+```
+
+PATH: `./internal/bloomring.go`
+```go
+package internal
+
+import (
+	"hash/fnv"
+	"sync"
+
+	"github.com/riobard/go-bloom"
+)
+
+// simply use Double FNV here as our Bloom Filter hash
+func doubleFNV(b []byte) (uint64, uint64) {
+	hx := fnv.New64()
+	hx.Write(b)
+	x := hx.Sum64()
+	hy := fnv.New64a()
+	hy.Write(b)
+	y := hy.Sum64()
+	return x, y
+}
+
+type BloomRing struct {
+	slotCapacity int
+	slotPosition int
+	slotCount    int
+	entryCounter int
+	slots        []bloom.Filter
+	mutex        sync.RWMutex
+}
+
+func NewBloomRing(slot, capacity int, falsePositiveRate float64) *BloomRing {
+	// Calculate entries for each slot
+	r := &BloomRing{
+		slotCapacity: capacity / slot,
+		slotCount:    slot,
+		slots:        make([]bloom.Filter, slot),
+	}
+	for i := 0; i < slot; i++ {
+		r.slots[i] = bloom.New(r.slotCapacity, falsePositiveRate, doubleFNV)
+	}
+	return r
+}
+
+func (r *BloomRing) Add(b []byte) {
+	if r == nil {
+		return
+	}
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	r.add(b)
+}
+
+func (r *BloomRing) add(b []byte) {
+	slot := r.slots[r.slotPosition]
+	if r.entryCounter > r.slotCapacity {
+		// Move to next slot and reset
+		r.slotPosition = (r.slotPosition + 1) % r.slotCount
+		slot = r.slots[r.slotPosition]
+		slot.Reset()
+		r.entryCounter = 0
+	}
+	r.entryCounter++
+	slot.Add(b)
+}
+
+func (r *BloomRing) Test(b []byte) bool {
+	if r == nil {
+		return false
+	}
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	test := r.test(b)
+	return test
+}
+
+func (r *BloomRing) test(b []byte) bool {
+	for _, s := range r.slots {
+		if s.Test(b) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *BloomRing) Check(b []byte) bool {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	if r.Test(b) {
+		return true
+	}
+	r.Add(b)
+	return false
+}
+```
+
+PATH: `./internal/saltfilter.go`
+```go
+package internal
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"sync"
+)
+
+// Those suggest value are all set according to
+// https://github.com/shadowsocks/shadowsocks-org/issues/44#issuecomment-281021054
+// Due to this package contains various internal implementation so const named with DefaultBR prefix
+const (
+	DefaultSFCapacity = 1e6
+	// FalsePositiveRate
+	DefaultSFFPR  = 1e-6
+	DefaultSFSlot = 10
+)
+
+const EnvironmentPrefix = "SHADOWSOCKS_"
+
+// A shared instance used for checking salt repeat
+var saltfilter *BloomRing
+
+// Used to initialize the saltfilter singleton only once.
+var initSaltfilterOnce sync.Once
+
+// GetSaltFilterSingleton returns the BloomRing singleton,
+// initializing it on first call.
+func getSaltFilterSingleton() *BloomRing {
+	initSaltfilterOnce.Do(func() {
+		var (
+			finalCapacity = DefaultSFCapacity
+			finalFPR      = DefaultSFFPR
+			finalSlot     = float64(DefaultSFSlot)
+		)
+		for _, opt := range []struct {
+			ENVName string
+			Target  *float64
+		}{
+			{
+				ENVName: "CAPACITY",
+				Target:  &finalCapacity,
+			},
+			{
+				ENVName: "FPR",
+				Target:  &finalFPR,
+			},
+			{
+				ENVName: "SLOT",
+				Target:  &finalSlot,
+			},
+		} {
+			envKey := EnvironmentPrefix + "SF_" + opt.ENVName
+			env := os.Getenv(envKey)
+			if env != "" {
+				p, err := strconv.ParseFloat(env, 64)
+				if err != nil {
+					panic(fmt.Sprintf("Invalid envrionment `%s` setting in saltfilter: %s", envKey, env))
+				}
+				*opt.Target = p
+			}
+		}
+		// Support disable saltfilter by given a negative capacity
+		if finalCapacity <= 0 {
+			return
+		}
+		saltfilter = NewBloomRing(int(finalSlot), int(finalCapacity), finalFPR)
+	})
+	return saltfilter
+}
+
+// TestSalt returns true if salt is repeated
+func TestSalt(b []byte) bool {
+	return getSaltFilterSingleton().Test(b)
+}
+
+// AddSalt salt to filter
+func AddSalt(b []byte) {
+	getSaltFilterSingleton().Add(b)
+}
+
+func CheckSalt(b []byte) bool {
+	return getSaltFilterSingleton().Test(b)
+}
+```
+
+PATH: `./plugin.go`
+```go
+package main
+
+import (
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"syscall"
+	"time"
+)
+
+var pluginCmd *exec.Cmd
+
+func startPlugin(plugin, pluginOpts, ssAddr string, isServer bool) (newAddr string, err error) {
+	logf("starting plugin (%s) with option (%s)....", plugin, pluginOpts)
+	freePort, err := getFreePort()
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch an unused port for plugin (%v)", err)
+	}
+	localHost := "127.0.0.1"
+	ssHost, ssPort, err := net.SplitHostPort(ssAddr)
+	if err != nil {
+		return "", err
+	}
+	newAddr = localHost + ":" + freePort
+	if isServer {
+		if ssHost == "" {
+			ssHost = "0.0.0.0"
+		}
+		logf("plugin (%s) will listen on %s:%s", plugin, ssHost, ssPort)
+	} else {
+		logf("plugin (%s) will listen on %s:%s", plugin, localHost, freePort)
+	}
+	err = execPlugin(plugin, pluginOpts, ssHost, ssPort, localHost, freePort)
+	return
+}
+
+func killPlugin() {
+	if pluginCmd != nil {
+		pluginCmd.Process.Signal(syscall.SIGTERM)
+		waitCh := make(chan struct{})
+		go func() {
+			pluginCmd.Wait()
+			close(waitCh)
+		}()
+		timeout := time.After(3 * time.Second)
+		select {
+		case <-waitCh:
+		case <-timeout:
+			pluginCmd.Process.Kill()
+		}
+	}
+}
+
+func execPlugin(plugin, pluginOpts, remoteHost, remotePort, localHost, localPort string) (err error) {
+	pluginFile := plugin
+	if fileExists(plugin) {
+		if !filepath.IsAbs(plugin) {
+			pluginFile = "./" + plugin
+		}
+	} else {
+		pluginFile, err = exec.LookPath(plugin)
+		if err != nil {
+			return err
+		}
+	}
+	logH := newLogHelper("[" + plugin + "]: ")
+	env := append(os.Environ(),
+		"SS_REMOTE_HOST="+remoteHost,
+		"SS_REMOTE_PORT="+remotePort,
+		"SS_LOCAL_HOST="+localHost,
+		"SS_LOCAL_PORT="+localPort,
+		"SS_PLUGIN_OPTIONS="+pluginOpts,
+	)
+	cmd := &exec.Cmd{
+		Path:   pluginFile,
+		Env:    env,
+		Stdout: logH,
+		Stderr: logH,
+	}
+	if err = cmd.Start(); err != nil {
+		return err
+	}
+	pluginCmd = cmd
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			logf("plugin exited (%v)\n", err)
+			os.Exit(2)
+		}
+		logf("plugin exited\n")
+		os.Exit(0)
+	}()
+	return nil
+}
+
+func fileExists(filename string) bool {
+	info, err := os.Stat(filename)
+	if os.IsNotExist(err) {
+		return false
+	}
+	return !info.IsDir()
+}
+
+func getFreePort() (string, error) {
+	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
+	if err != nil {
+		return "", err
+	}
+
+	l, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		return "", err
+	}
+	port := fmt.Sprintf("%d", l.Addr().(*net.TCPAddr).Port)
+	l.Close()
+	return port, nil
+}
+```
+
+PATH: `./nfutil/nf_linux.go`
+```go
+package nfutil
+
+import (
+	"net"
+	"syscall"
+	"unsafe"
+)
+
+// Get the original destination of a TCP connection redirected by Netfilter.
+func GetOrigDst(c *net.TCPConn, ipv6 bool) (*net.TCPAddr, error) {
+	rc, err := c.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	var addr *net.TCPAddr
+	rc.Control(func(fd uintptr) {
+		if ipv6 {
+			addr, err = ipv6_getorigdst(fd)
+		} else {
+			addr, err = getorigdst(fd)
+		}
+	})
+	return addr, err
+}
+
+// Call getorigdst() from linux/net/ipv4/netfilter/nf_conntrack_l3proto_ipv4.c
+func getorigdst(fd uintptr) (*net.TCPAddr, error) {
+	const _SO_ORIGINAL_DST = 80 // from linux/include/uapi/linux/netfilter_ipv4.h
+	var raw syscall.RawSockaddrInet4
+	siz := unsafe.Sizeof(raw)
+	if err := socketcall(GETSOCKOPT, fd, syscall.IPPROTO_IP, _SO_ORIGINAL_DST, uintptr(unsafe.Pointer(&raw)), uintptr(unsafe.Pointer(&siz)), 0); err != nil {
+		return nil, err
+	}
+	var addr net.TCPAddr
+	addr.IP = raw.Addr[:]
+	port := (*[2]byte)(unsafe.Pointer(&raw.Port)) // raw.Port is big-endian
+	addr.Port = int(port[0])<<8 | int(port[1])
+	return &addr, nil
+}
+
+// Call ipv6_getorigdst() from linux/net/ipv6/netfilter/nf_conntrack_l3proto_ipv6.c
+// NOTE: I haven't tried yet but it should work since Linux 3.8.
+func ipv6_getorigdst(fd uintptr) (*net.TCPAddr, error) {
+	const _IP6T_SO_ORIGINAL_DST = 80 // from linux/include/uapi/linux/netfilter_ipv6/ip6_tables.h
+	var raw syscall.RawSockaddrInet6
+	siz := unsafe.Sizeof(raw)
+	if err := socketcall(GETSOCKOPT, fd, syscall.IPPROTO_IPV6, _IP6T_SO_ORIGINAL_DST, uintptr(unsafe.Pointer(&raw)), uintptr(unsafe.Pointer(&siz)), 0); err != nil {
+		return nil, err
+	}
+	var addr net.TCPAddr
+	addr.IP = raw.Addr[:]
+	port := (*[2]byte)(unsafe.Pointer(&raw.Port)) // raw.Port is big-endian
+	addr.Port = int(port[0])<<8 | int(port[1])
+	return &addr, nil
+}
+```
+
+PATH: `./nfutil/socketcall_linux_386.go`
+```go
+package nfutil
+
+import (
+	"syscall"
+	"unsafe"
+)
+
+const GETSOCKOPT = 15 // https://golang.org/src/syscall/syscall_linux_386.go#L183
+
+func socketcall(call, a0, a1, a2, a3, a4, a5 uintptr) error {
+	var a [6]uintptr
+	a[0], a[1], a[2], a[3], a[4], a[5] = a0, a1, a2, a3, a4, a5
+	if _, _, errno := syscall.Syscall6(syscall.SYS_SOCKETCALL, call, uintptr(unsafe.Pointer(&a)), 0, 0, 0, 0); errno != 0 {
+		return errno
+	}
+	return nil
+}
+```
+
+PATH: `./nfutil/socketcall_linux_other.go`
+```go
+// +build linux,!386
+
+package nfutil
+
+import "syscall"
+
+const GETSOCKOPT = syscall.SYS_GETSOCKOPT
+
+func socketcall(call, a0, a1, a2, a3, a4, a5 uintptr) error {
+	if _, _, errno := syscall.Syscall6(call, a0, a1, a2, a3, a4, a5); errno != 0 {
+		return errno
+	}
+	return nil
+}
+```
+
+PATH: `./tcp_other.go`
+```go
+// +build !linux,!darwin
+
+package main
+
+import (
+	"net"
+)
+
+func redirLocal(addr, server string, shadow func(net.Conn) net.Conn) {
+	logf("TCP redirect not supported")
+}
+
+func redir6Local(addr, server string, shadow func(net.Conn) net.Conn) {
+	logf("TCP6 redirect not supported")
+}
+```
+
+PATH: `./udp.go`
+```go
+package main
+
+import (
+	"fmt"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/shadowsocks/go-shadowsocks2/socks"
+)
+
+type mode int
+
+const (
+	remoteServer mode = iota
+	relayClient
+	socksClient
+)
+
+const udpBufSize = 64 * 1024
+
+// Listen on laddr for UDP packets, encrypt and send to server to reach target.
+func udpLocal(laddr, server, target string, shadow func(net.PacketConn) net.PacketConn) {
+	srvAddr, err := net.ResolveUDPAddr("udp", server)
+	if err != nil {
+		logf("UDP server address error: %v", err)
+		return
+	}
+
+	tgt := socks.ParseAddr(target)
+	if tgt == nil {
+		err = fmt.Errorf("invalid target address: %q", target)
+		logf("UDP target address error: %v", err)
+		return
+	}
+
+	c, err := net.ListenPacket("udp", laddr)
+	if err != nil {
+		logf("UDP local listen error: %v", err)
+		return
+	}
+	defer c.Close()
+
+	nm := newNATmap(config.UDPTimeout)
+	buf := make([]byte, udpBufSize)
+	copy(buf, tgt)
+
+	logf("UDP tunnel %s <-> %s <-> %s", laddr, server, target)
+	for {
+		n, raddr, err := c.ReadFrom(buf[len(tgt):])
+		if err != nil {
+			logf("UDP local read error: %v", err)
+			continue
+		}
+
+		pc := nm.Get(raddr.String())
+		if pc == nil {
+			pc, err = net.ListenPacket("udp", "")
+			if err != nil {
+				logf("UDP local listen error: %v", err)
+				continue
+			}
+
+			pc = shadow(pc)
+			nm.Add(raddr, c, pc, relayClient)
+		}
+
+		_, err = pc.WriteTo(buf[:len(tgt)+n], srvAddr)
+		if err != nil {
+			logf("UDP local write error: %v", err)
+			continue
+		}
+	}
+}
+
+// Listen on laddr for Socks5 UDP packets, encrypt and send to server to reach target.
+func udpSocksLocal(laddr, server string, shadow func(net.PacketConn) net.PacketConn) {
+	srvAddr, err := net.ResolveUDPAddr("udp", server)
+	if err != nil {
+		logf("UDP server address error: %v", err)
+		return
+	}
+
+	c, err := net.ListenPacket("udp", laddr)
+	if err != nil {
+		logf("UDP local listen error: %v", err)
+		return
+	}
+	defer c.Close()
+
+	nm := newNATmap(config.UDPTimeout)
+	buf := make([]byte, udpBufSize)
+
+	for {
+		n, raddr, err := c.ReadFrom(buf)
+		if err != nil {
+			logf("UDP local read error: %v", err)
+			continue
+		}
+
+		pc := nm.Get(raddr.String())
+		if pc == nil {
+			pc, err = net.ListenPacket("udp", "")
+			if err != nil {
+				logf("UDP local listen error: %v", err)
+				continue
+			}
+			logf("UDP socks tunnel %s <-> %s <-> %s", laddr, server, socks.Addr(buf[3:]))
+			pc = shadow(pc)
+			nm.Add(raddr, c, pc, socksClient)
+		}
+
+		_, err = pc.WriteTo(buf[3:n], srvAddr)
+		if err != nil {
+			logf("UDP local write error: %v", err)
+			continue
+		}
+	}
+}
+
+// Listen on addr for encrypted packets and basically do UDP NAT.
+func udpRemote(addr string, shadow func(net.PacketConn) net.PacketConn) {
+	c, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		logf("UDP remote listen error: %v", err)
+		return
+	}
+	defer c.Close()
+	c = shadow(c)
+
+	nm := newNATmap(config.UDPTimeout)
+	buf := make([]byte, udpBufSize)
+
+	logf("listening UDP on %s", addr)
+	for {
+		n, raddr, err := c.ReadFrom(buf)
+		if err != nil {
+			logf("UDP remote read error: %v", err)
+			continue
+		}
+
+		tgtAddr := socks.SplitAddr(buf[:n])
+		if tgtAddr == nil {
+			logf("failed to split target address from packet: %q", buf[:n])
+			continue
+		}
+
+		tgtUDPAddr, err := net.ResolveUDPAddr("udp", tgtAddr.String())
+		if err != nil {
+			logf("failed to resolve target UDP address: %v", err)
+			continue
+		}
+
+		payload := buf[len(tgtAddr):n]
+
+		pc := nm.Get(raddr.String())
+		if pc == nil {
+			pc, err = net.ListenPacket("udp", "")
+			if err != nil {
+				logf("UDP remote listen error: %v", err)
+				continue
+			}
+
+			nm.Add(raddr, c, pc, remoteServer)
+		}
+
+		_, err = pc.WriteTo(payload, tgtUDPAddr) // accept only UDPAddr despite the signature
+		if err != nil {
+			logf("UDP remote write error: %v", err)
+			continue
+		}
+	}
+}
+
+// Packet NAT table
+type natmap struct {
+	sync.RWMutex
+	m       map[string]net.PacketConn
+	timeout time.Duration
+}
+
+func newNATmap(timeout time.Duration) *natmap {
+	m := &natmap{}
+	m.m = make(map[string]net.PacketConn)
+	m.timeout = timeout
+	return m
+}
+
+func (m *natmap) Get(key string) net.PacketConn {
+	m.RLock()
+	defer m.RUnlock()
+	return m.m[key]
+}
+
+func (m *natmap) Set(key string, pc net.PacketConn) {
+	m.Lock()
+	defer m.Unlock()
+
+	m.m[key] = pc
+}
+
+func (m *natmap) Del(key string) net.PacketConn {
+	m.Lock()
+	defer m.Unlock()
+
+	pc, ok := m.m[key]
+	if ok {
+		delete(m.m, key)
+		return pc
+	}
+	return nil
+}
+
+func (m *natmap) Add(peer net.Addr, dst, src net.PacketConn, role mode) {
+	m.Set(peer.String(), src)
+
+	go func() {
+		timedCopy(dst, peer, src, m.timeout, role)
+		if pc := m.Del(peer.String()); pc != nil {
+			pc.Close()
+		}
+	}()
+}
+
+// copy from src to dst at target with read timeout
+func timedCopy(dst net.PacketConn, target net.Addr, src net.PacketConn, timeout time.Duration, role mode) error {
+	buf := make([]byte, udpBufSize)
+
+	for {
+		src.SetReadDeadline(time.Now().Add(timeout))
+		n, raddr, err := src.ReadFrom(buf)
+		if err != nil {
+			return err
+		}
+
+		switch role {
+		case remoteServer: // server -> client: add original packet source
+			srcAddr := socks.ParseAddr(raddr.String())
+			copy(buf[len(srcAddr):], buf[:n])
+			copy(buf, srcAddr)
+			_, err = dst.WriteTo(buf[:len(srcAddr)+n], target)
+		case relayClient: // client -> user: strip original packet source
+			srcAddr := socks.SplitAddr(buf[:n])
+			_, err = dst.WriteTo(buf[len(srcAddr):n], target)
+		case socksClient: // client -> socks5 program: just set RSV and FRAG = 0
+			_, err = dst.WriteTo(append([]byte{0, 0, 0}, buf[:n]...), target)
+		}
+
+		if err != nil {
+			return err
+		}
+	}
+}
+```
+
+PATH: `./shadowaead/stream.go`
+```go
+package shadowaead
+
+import (
+	"bytes"
+	"crypto/cipher"
+	"crypto/rand"
+	"io"
+	"net"
+
+	"github.com/shadowsocks/go-shadowsocks2/internal"
+)
+
+// payloadSizeMask is the maximum size of payload in bytes.
+const payloadSizeMask = 0x3FFF // 16*1024 - 1
+
+type writer struct {
+	io.Writer
+	cipher.AEAD
+	nonce []byte
+	buf   []byte
+}
+
+// NewWriter wraps an io.Writer with AEAD encryption.
+func NewWriter(w io.Writer, aead cipher.AEAD) io.Writer { return newWriter(w, aead) }
+
+func newWriter(w io.Writer, aead cipher.AEAD) *writer {
+	return &writer{
+		Writer: w,
+		AEAD:   aead,
+		buf:    make([]byte, 2+aead.Overhead()+payloadSizeMask+aead.Overhead()),
+		nonce:  make([]byte, aead.NonceSize()),
+	}
+}
+
+// Write encrypts b and writes to the embedded io.Writer.
+func (w *writer) Write(b []byte) (int, error) {
+	n, err := w.ReadFrom(bytes.NewBuffer(b))
+	return int(n), err
+}
+
+// ReadFrom reads from the given io.Reader until EOF or error, encrypts and
+// writes to the embedded io.Writer. Returns number of bytes read from r and
+// any error encountered.
+func (w *writer) ReadFrom(r io.Reader) (n int64, err error) {
+	for {
+		buf := w.buf
+		payloadBuf := buf[2+w.Overhead() : 2+w.Overhead()+payloadSizeMask]
+		nr, er := r.Read(payloadBuf)
+
+		if nr > 0 {
+			n += int64(nr)
+			buf = buf[:2+w.Overhead()+nr+w.Overhead()]
+			payloadBuf = payloadBuf[:nr]
+			buf[0], buf[1] = byte(nr>>8), byte(nr) // big-endian payload size
+			w.Seal(buf[:0], w.nonce, buf[:2], nil)
+			increment(w.nonce)
+
+			w.Seal(payloadBuf[:0], w.nonce, payloadBuf, nil)
+			increment(w.nonce)
+
+			_, ew := w.Writer.Write(buf)
+			if ew != nil {
+				err = ew
+				break
+			}
+		}
+
+		if er != nil {
+			if er != io.EOF { // ignore EOF as per io.ReaderFrom contract
+				err = er
+			}
+			break
+		}
+	}
+
+	return n, err
+}
+
+type reader struct {
+	io.Reader
+	cipher.AEAD
+	nonce    []byte
+	buf      []byte
+	leftover []byte
+}
+
+// NewReader wraps an io.Reader with AEAD decryption.
+func NewReader(r io.Reader, aead cipher.AEAD) io.Reader { return newReader(r, aead) }
+
+func newReader(r io.Reader, aead cipher.AEAD) *reader {
+	return &reader{
+		Reader: r,
+		AEAD:   aead,
+		buf:    make([]byte, payloadSizeMask+aead.Overhead()),
+		nonce:  make([]byte, aead.NonceSize()),
+	}
+}
+
+// read and decrypt a record into the internal buffer. Return decrypted payload length and any error encountered.
+func (r *reader) read() (int, error) {
+	// decrypt payload size
+	buf := r.buf[:2+r.Overhead()]
+	_, err := io.ReadFull(r.Reader, buf)
+	if err != nil {
+		return 0, err
+	}
+
+	_, err = r.Open(buf[:0], r.nonce, buf, nil)
+	increment(r.nonce)
+	if err != nil {
+		return 0, err
+	}
+
+	size := (int(buf[0])<<8 + int(buf[1])) & payloadSizeMask
+
+	// decrypt payload
+	buf = r.buf[:size+r.Overhead()]
+	_, err = io.ReadFull(r.Reader, buf)
+	if err != nil {
+		return 0, err
+	}
+
+	_, err = r.Open(buf[:0], r.nonce, buf, nil)
+	increment(r.nonce)
+	if err != nil {
+		return 0, err
+	}
+
+	return size, nil
+}
+
+// Read reads from the embedded io.Reader, decrypts and writes to b.
+func (r *reader) Read(b []byte) (int, error) {
+	// copy decrypted bytes (if any) from previous record first
+	if len(r.leftover) > 0 {
+		n := copy(b, r.leftover)
+		r.leftover = r.leftover[n:]
+		return n, nil
+	}
+
+	n, err := r.read()
+	m := copy(b, r.buf[:n])
+	if m < n { // insufficient len(b), keep leftover for next read
+		r.leftover = r.buf[m:n]
+	}
+	return m, err
+}
+
+// WriteTo reads from the embedded io.Reader, decrypts and writes to w until
+// there's no more data to write or when an error occurs. Return number of
+// bytes written to w and any error encountered.
+func (r *reader) WriteTo(w io.Writer) (n int64, err error) {
+	// write decrypted bytes left over from previous record
+	for len(r.leftover) > 0 {
+		nw, ew := w.Write(r.leftover)
+		r.leftover = r.leftover[nw:]
+		n += int64(nw)
+		if ew != nil {
+			return n, ew
+		}
+	}
+
+	for {
+		nr, er := r.read()
+		if nr > 0 {
+			nw, ew := w.Write(r.buf[:nr])
+			n += int64(nw)
+
+			if ew != nil {
+				err = ew
+				break
+			}
+		}
+
+		if er != nil {
+			if er != io.EOF { // ignore EOF as per io.Copy contract (using src.WriteTo shortcut)
+				err = er
+			}
+			break
+		}
+	}
+
+	return n, err
+}
+
+// increment little-endian encoded unsigned integer b. Wrap around on overflow.
+func increment(b []byte) {
+	for i := range b {
+		b[i]++
+		if b[i] != 0 {
+			return
+		}
+	}
+}
+
+type streamConn struct {
+	net.Conn
+	Cipher
+	r *reader
+	w *writer
+}
+
+func (c *streamConn) initReader() error {
+	salt := make([]byte, c.SaltSize())
+	if _, err := io.ReadFull(c.Conn, salt); err != nil {
+		return err
+	}
+	aead, err := c.Decrypter(salt)
+	if err != nil {
+		return err
+	}
+
+	if internal.CheckSalt(salt) {
+		return ErrRepeatedSalt
+	}
+
+	c.r = newReader(c.Conn, aead)
+	return nil
+}
+
+func (c *streamConn) Read(b []byte) (int, error) {
+	if c.r == nil {
+		if err := c.initReader(); err != nil {
+			return 0, err
+		}
+	}
+	return c.r.Read(b)
+}
+
+func (c *streamConn) WriteTo(w io.Writer) (int64, error) {
+	if c.r == nil {
+		if err := c.initReader(); err != nil {
+			return 0, err
+		}
+	}
+	return c.r.WriteTo(w)
+}
+
+func (c *streamConn) initWriter() error {
+	salt := make([]byte, c.SaltSize())
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+		return err
+	}
+	aead, err := c.Encrypter(salt)
+	if err != nil {
+		return err
+	}
+	_, err = c.Conn.Write(salt)
+	if err != nil {
+		return err
+	}
+	internal.AddSalt(salt)
+	c.w = newWriter(c.Conn, aead)
+	return nil
+}
+
+func (c *streamConn) Write(b []byte) (int, error) {
+	if c.w == nil {
+		if err := c.initWriter(); err != nil {
+			return 0, err
+		}
+	}
+	return c.w.Write(b)
+}
+
+func (c *streamConn) ReadFrom(r io.Reader) (int64, error) {
+	if c.w == nil {
+		if err := c.initWriter(); err != nil {
+			return 0, err
+		}
+	}
+	return c.w.ReadFrom(r)
+}
+
+// NewConn wraps a stream-oriented net.Conn with cipher.
+func NewConn(c net.Conn, ciph Cipher) net.Conn { return &streamConn{Conn: c, Cipher: ciph} }
+```
+
+PATH: `./shadowaead/packet.go`
+```go
+package shadowaead
+
+import (
+	"crypto/rand"
+	"errors"
+	"io"
+	"net"
+	"sync"
+
+	"github.com/shadowsocks/go-shadowsocks2/internal"
+)
+
+// ErrShortPacket means that the packet is too short for a valid encrypted packet.
+var ErrShortPacket = errors.New("short packet")
+
+var _zerononce [128]byte // read-only. 128 bytes is more than enough.
+
+// Pack encrypts plaintext using Cipher with a randomly generated salt and
+// returns a slice of dst containing the encrypted packet and any error occurred.
+// Ensure len(dst) >= ciph.SaltSize() + len(plaintext) + aead.Overhead().
+func Pack(dst, plaintext []byte, ciph Cipher) ([]byte, error) {
+	saltSize := ciph.SaltSize()
+	salt := dst[:saltSize]
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+		return nil, err
+	}
+
+	aead, err := ciph.Encrypter(salt)
+	if err != nil {
+		return nil, err
+	}
+	internal.AddSalt(salt)
+
+	if len(dst) < saltSize+len(plaintext)+aead.Overhead() {
+		return nil, io.ErrShortBuffer
+	}
+	b := aead.Seal(dst[saltSize:saltSize], _zerononce[:aead.NonceSize()], plaintext, nil)
+	return dst[:saltSize+len(b)], nil
+}
+
+// Unpack decrypts pkt using Cipher and returns a slice of dst containing the decrypted payload and any error occurred.
+// Ensure len(dst) >= len(pkt) - aead.SaltSize() - aead.Overhead().
+func Unpack(dst, pkt []byte, ciph Cipher) ([]byte, error) {
+	saltSize := ciph.SaltSize()
+	if len(pkt) < saltSize {
+		return nil, ErrShortPacket
+	}
+	salt := pkt[:saltSize]
+	aead, err := ciph.Decrypter(salt)
+	if err != nil {
+		return nil, err
+	}
+	if internal.CheckSalt(salt) {
+		return nil, ErrRepeatedSalt
+	}
+	if len(pkt) < saltSize+aead.Overhead() {
+		return nil, ErrShortPacket
+	}
+	if saltSize+len(dst)+aead.Overhead() < len(pkt) {
+		return nil, io.ErrShortBuffer
+	}
+	b, err := aead.Open(dst[:0], _zerononce[:aead.NonceSize()], pkt[saltSize:], nil)
+	return b, err
+}
+
+type packetConn struct {
+	net.PacketConn
+	Cipher
+	sync.Mutex
+	buf []byte // write lock
+}
+
+// NewPacketConn wraps a net.PacketConn with cipher
+func NewPacketConn(c net.PacketConn, ciph Cipher) net.PacketConn {
+	const maxPacketSize = 64 * 1024
+	return &packetConn{PacketConn: c, Cipher: ciph, buf: make([]byte, maxPacketSize)}
+}
+
+// WriteTo encrypts b and write to addr using the embedded PacketConn.
+func (c *packetConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	c.Lock()
+	defer c.Unlock()
+	buf, err := Pack(c.buf, b, c)
+	if err != nil {
+		return 0, err
+	}
+	_, err = c.PacketConn.WriteTo(buf, addr)
+	return len(b), err
+}
+
+// ReadFrom reads from the embedded PacketConn and decrypts into b.
+func (c *packetConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, addr, err := c.PacketConn.ReadFrom(b)
+	if err != nil {
+		return n, addr, err
+	}
+	bb, err := Unpack(b[c.Cipher.SaltSize():], b[:n], c)
+	if err != nil {
+		return n, addr, err
+	}
+	copy(b, bb)
+	return len(bb), addr, err
+}
+```
+
+PATH: `./shadowaead/doc.go`
+```go
+/*
+Package shadowaead implements a simple AEAD-protected secure protocol.
+
+In general, there are two types of connections: stream-oriented and packet-oriented.
+Stream-oriented connections (e.g. TCP) assume reliable and orderly delivery of bytes.
+Packet-oriented connections (e.g. UDP) assume unreliable and out-of-order delivery of packets,
+where each packet is either delivered intact or lost.
+
+An encrypted stream starts with a random salt to derive a session key, followed by any number of
+encrypted records. Each encrypted record has the following structure:
+
+    [encrypted payload length]
+    [payload length tag]
+    [encrypted payload]
+    [payload tag]
+
+Payload length is 2-byte unsigned big-endian integer capped at 0x3FFF (16383).
+The higher 2 bits are reserved and must be set to zero. The first AEAD encrypt/decrypt
+operation uses a counting nonce starting from 0. After each encrypt/decrypt operation,
+the nonce is incremented by one as if it were an unsigned little-endian integer.
+
+
+Each encrypted packet transmitted on a packet-oriented connection has the following structure:
+
+    [random salt]
+    [encrypted payload]
+    [payload tag]
+
+The salt is used to derive a subkey to initiate an AEAD. Packets are encrypted/decrypted independently
+using zero nonce.
+
+In both stream-oriented and packet-oriented connections, length of nonce and tag varies
+depending on which AEAD is used. Salt should be at least 16-byte long.
+*/
+package shadowaead
+```
+
+PATH: `./shadowaead/cipher.go`
+```go
+package shadowaead
+
+import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha1"
+	"errors"
+	"io"
+	"strconv"
+
+	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/hkdf"
+)
+
+// ErrRepeatedSalt means detected a reused salt
+var ErrRepeatedSalt = errors.New("repeated salt detected")
+
+type Cipher interface {
+	KeySize() int
+	SaltSize() int
+	Encrypter(salt []byte) (cipher.AEAD, error)
+	Decrypter(salt []byte) (cipher.AEAD, error)
+}
+
+type KeySizeError int
+
+func (e KeySizeError) Error() string {
+	return "key size error: need " + strconv.Itoa(int(e)) + " bytes"
+}
+
+func hkdfSHA1(secret, salt, info, outkey []byte) {
+	r := hkdf.New(sha1.New, secret, salt, info)
+	if _, err := io.ReadFull(r, outkey); err != nil {
+		panic(err) // should never happen
+	}
+}
+
+type metaCipher struct {
+	psk      []byte
+	makeAEAD func(key []byte) (cipher.AEAD, error)
+}
+
+func (a *metaCipher) KeySize() int { return len(a.psk) }
+func (a *metaCipher) SaltSize() int {
+	if ks := a.KeySize(); ks > 16 {
+		return ks
+	}
+	return 16
+}
+func (a *metaCipher) Encrypter(salt []byte) (cipher.AEAD, error) {
+	subkey := make([]byte, a.KeySize())
+	hkdfSHA1(a.psk, salt, []byte("ss-subkey"), subkey)
+	return a.makeAEAD(subkey)
+}
+func (a *metaCipher) Decrypter(salt []byte) (cipher.AEAD, error) {
+	subkey := make([]byte, a.KeySize())
+	hkdfSHA1(a.psk, salt, []byte("ss-subkey"), subkey)
+	return a.makeAEAD(subkey)
+}
+
+func aesGCM(key []byte) (cipher.AEAD, error) {
+	blk, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(blk)
+}
+
+// AESGCM creates a new Cipher with a pre-shared key. len(psk) must be
+// one of 16, 24, or 32 to select AES-128/196/256-GCM.
+func AESGCM(psk []byte) (Cipher, error) {
+	switch l := len(psk); l {
+	case 16, 24, 32: // AES 128/196/256
+	default:
+		return nil, aes.KeySizeError(l)
+	}
+	return &metaCipher{psk: psk, makeAEAD: aesGCM}, nil
+}
+
+// Chacha20Poly1305 creates a new Cipher with a pre-shared key. len(psk)
+// must be 32.
+func Chacha20Poly1305(psk []byte) (Cipher, error) {
+	if len(psk) != chacha20poly1305.KeySize {
+		return nil, KeySizeError(chacha20poly1305.KeySize)
+	}
+	return &metaCipher{psk: psk, makeAEAD: chacha20poly1305.New}, nil
+}
+```
+
+PATH: `./tcp.go`
+```go
+package main
+
+import (
+	"bufio"
+	"errors"
+	"io"
+	"io/ioutil"
+	"net"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/shadowsocks/go-shadowsocks2/socks"
+)
+
+// Create a SOCKS server listening on addr and proxy to server.
+func socksLocal(addr, server string, shadow func(net.Conn) net.Conn) {
+	logf("SOCKS proxy %s <-> %s", addr, server)
+	tcpLocal(addr, server, shadow, func(c net.Conn) (socks.Addr, error) { return socks.Handshake(c) })
+}
+
+// Create a TCP tunnel from addr to target via server.
+func tcpTun(addr, server, target string, shadow func(net.Conn) net.Conn) {
+	tgt := socks.ParseAddr(target)
+	if tgt == nil {
+		logf("invalid target address %q", target)
+		return
+	}
+	logf("TCP tunnel %s <-> %s <-> %s", addr, server, target)
+	tcpLocal(addr, server, shadow, func(net.Conn) (socks.Addr, error) { return tgt, nil })
+}
+
+// Listen on addr and proxy to server to reach target from getAddr.
+func tcpLocal(addr, server string, shadow func(net.Conn) net.Conn, getAddr func(net.Conn) (socks.Addr, error)) {
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		logf("failed to listen on %s: %v", addr, err)
+		return
+	}
+
+	for {
+		c, err := l.Accept()
+		if err != nil {
+			logf("failed to accept: %s", err)
+			continue
+		}
+
+		go func() {
+			defer c.Close()
+			tgt, err := getAddr(c)
+			if err != nil {
+
+				// UDP: keep the connection until disconnect then free the UDP socket
+				if err == socks.InfoUDPAssociate {
+					buf := make([]byte, 1)
+					// block here
+					for {
+						_, err := c.Read(buf)
+						if err, ok := err.(net.Error); ok && err.Timeout() {
+							continue
+						}
+						logf("UDP Associate End.")
+						return
+					}
+				}
+
+				logf("failed to get target address: %v", err)
+				return
+			}
+
+			rc, err := net.Dial("tcp", server)
+			if err != nil {
+				logf("failed to connect to server %v: %v", server, err)
+				return
+			}
+			defer rc.Close()
+			if config.TCPCork {
+				rc = timedCork(rc, 10*time.Millisecond, 1280)
+			}
+			rc = shadow(rc)
+
+			if _, err = rc.Write(tgt); err != nil {
+				logf("failed to send target address: %v", err)
+				return
+			}
+
+			logf("proxy %s <-> %s <-> %s", c.RemoteAddr(), server, tgt)
+			if err = relay(rc, c); err != nil {
+				logf("relay error: %v", err)
+			}
+		}()
+	}
+}
+
+// Listen on addr for incoming connections.
+func tcpRemote(addr string, shadow func(net.Conn) net.Conn) {
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		logf("failed to listen on %s: %v", addr, err)
+		return
+	}
+
+	logf("listening TCP on %s", addr)
+	for {
+		c, err := l.Accept()
+		if err != nil {
+			logf("failed to accept: %v", err)
+			continue
+		}
+
+		go func() {
+			defer c.Close()
+			if config.TCPCork {
+				c = timedCork(c, 10*time.Millisecond, 1280)
+			}
+			sc := shadow(c)
+
+			tgt, err := socks.ReadAddr(sc)
+			if err != nil {
+				logf("failed to get target address from %v: %v", c.RemoteAddr(), err)
+				// drain c to avoid leaking server behavioral features
+				// see https://www.ndss-symposium.org/ndss-paper/detecting-probe-resistant-proxies/
+				_, err = io.Copy(ioutil.Discard, c)
+				if err != nil {
+					logf("discard error: %v", err)
+				}
+				return
+			}
+
+			rc, err := net.Dial("tcp", tgt.String())
+			if err != nil {
+				logf("failed to connect to target: %v", err)
+				return
+			}
+			defer rc.Close()
+
+			logf("proxy %s <-> %s", c.RemoteAddr(), tgt)
+			if err = relay(sc, rc); err != nil {
+				logf("relay error: %v", err)
+			}
+		}()
+	}
+}
+
+// relay copies between left and right bidirectionally
+func relay(left, right net.Conn) error {
+	var err, err1 error
+	var wg sync.WaitGroup
+	var wait = 5 * time.Second
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err1 = io.Copy(right, left)
+		right.SetReadDeadline(time.Now().Add(wait)) // unblock read on right
+	}()
+	_, err = io.Copy(left, right)
+	left.SetReadDeadline(time.Now().Add(wait)) // unblock read on left
+	wg.Wait()
+	if err1 != nil && !errors.Is(err1, os.ErrDeadlineExceeded) { // requires Go 1.15+
+		return err1
+	}
+	if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+		return err
+	}
+	return nil
+}
+
+type corkedConn struct {
+	net.Conn
+	bufw   *bufio.Writer
+	corked bool
+	delay  time.Duration
+	err    error
+	lock   sync.Mutex
+	once   sync.Once
+}
+
+func timedCork(c net.Conn, d time.Duration, bufSize int) net.Conn {
+	return &corkedConn{
+		Conn:   c,
+		bufw:   bufio.NewWriterSize(c, bufSize),
+		corked: true,
+		delay:  d,
+	}
+}
+
+func (w *corkedConn) Write(p []byte) (int, error) {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	if w.err != nil {
+		return 0, w.err
+	}
+	if w.corked {
+		w.once.Do(func() {
+			time.AfterFunc(w.delay, func() {
+				w.lock.Lock()
+				defer w.lock.Unlock()
+				w.corked = false
+				w.err = w.bufw.Flush()
+			})
+		})
+		return w.bufw.Write(p)
+	}
+	return w.Conn.Write(p)
+}
+```
+
+PATH: `./socks/socks.go`
+```go
+// Package socks implements essential parts of SOCKS protocol.
+package socks
+
+import (
+	"io"
+	"net"
+	"strconv"
+)
+
+// UDPEnabled is the toggle for UDP support
+var UDPEnabled = false
+
+// SOCKS request commands as defined in RFC 1928 section 4.
+const (
+	CmdConnect      = 1
+	CmdBind         = 2
+	CmdUDPAssociate = 3
+)
+
+// SOCKS address types as defined in RFC 1928 section 5.
+const (
+	AtypIPv4       = 1
+	AtypDomainName = 3
+	AtypIPv6       = 4
+)
+
+// Error represents a SOCKS error
+type Error byte
+
+func (err Error) Error() string {
+	return "SOCKS error: " + strconv.Itoa(int(err))
+}
+
+// SOCKS errors as defined in RFC 1928 section 6.
+const (
+	ErrGeneralFailure       = Error(1)
+	ErrConnectionNotAllowed = Error(2)
+	ErrNetworkUnreachable   = Error(3)
+	ErrHostUnreachable      = Error(4)
+	ErrConnectionRefused    = Error(5)
+	ErrTTLExpired           = Error(6)
+	ErrCommandNotSupported  = Error(7)
+	ErrAddressNotSupported  = Error(8)
+	InfoUDPAssociate        = Error(9)
+)
+
+// MaxAddrLen is the maximum size of SOCKS address in bytes.
+const MaxAddrLen = 1 + 1 + 255 + 2
+
+// Addr represents a SOCKS address as defined in RFC 1928 section 5.
+type Addr []byte
+
+// String serializes SOCKS address a to string form.
+func (a Addr) String() string {
+	var host, port string
+
+	switch a[0] { // address type
+	case AtypDomainName:
+		host = string(a[2 : 2+int(a[1])])
+		port = strconv.Itoa((int(a[2+int(a[1])]) << 8) | int(a[2+int(a[1])+1]))
+	case AtypIPv4:
+		host = net.IP(a[1 : 1+net.IPv4len]).String()
+		port = strconv.Itoa((int(a[1+net.IPv4len]) << 8) | int(a[1+net.IPv4len+1]))
+	case AtypIPv6:
+		host = net.IP(a[1 : 1+net.IPv6len]).String()
+		port = strconv.Itoa((int(a[1+net.IPv6len]) << 8) | int(a[1+net.IPv6len+1]))
+	}
+
+	return net.JoinHostPort(host, port)
+}
+
+func readAddr(r io.Reader, b []byte) (Addr, error) {
+	if len(b) < MaxAddrLen {
+		return nil, io.ErrShortBuffer
+	}
+	_, err := io.ReadFull(r, b[:1]) // read 1st byte for address type
+	if err != nil {
+		return nil, err
+	}
+
+	switch b[0] {
+	case AtypDomainName:
+		_, err = io.ReadFull(r, b[1:2]) // read 2nd byte for domain length
+		if err != nil {
+			return nil, err
+		}
+		_, err = io.ReadFull(r, b[2:2+int(b[1])+2])
+		return b[:1+1+int(b[1])+2], err
+	case AtypIPv4:
+		_, err = io.ReadFull(r, b[1:1+net.IPv4len+2])
+		return b[:1+net.IPv4len+2], err
+	case AtypIPv6:
+		_, err = io.ReadFull(r, b[1:1+net.IPv6len+2])
+		return b[:1+net.IPv6len+2], err
+	}
+
+	return nil, ErrAddressNotSupported
+}
+
+// ReadAddr reads just enough bytes from r to get a valid Addr.
+func ReadAddr(r io.Reader) (Addr, error) {
+	return readAddr(r, make([]byte, MaxAddrLen))
+}
+
+// SplitAddr slices a SOCKS address from beginning of b. Returns nil if failed.
+func SplitAddr(b []byte) Addr {
+	addrLen := 1
+	if len(b) < addrLen {
+		return nil
+	}
+
+	switch b[0] {
+	case AtypDomainName:
+		if len(b) < 2 {
+			return nil
+		}
+		addrLen = 1 + 1 + int(b[1]) + 2
+	case AtypIPv4:
+		addrLen = 1 + net.IPv4len + 2
+	case AtypIPv6:
+		addrLen = 1 + net.IPv6len + 2
+	default:
+		return nil
+
+	}
+
+	if len(b) < addrLen {
+		return nil
+	}
+
+	return b[:addrLen]
+}
+
+// ParseAddr parses the address in string s. Returns nil if failed.
+func ParseAddr(s string) Addr {
+	var addr Addr
+	host, port, err := net.SplitHostPort(s)
+	if err != nil {
+		return nil
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			addr = make([]byte, 1+net.IPv4len+2)
+			addr[0] = AtypIPv4
+			copy(addr[1:], ip4)
+		} else {
+			addr = make([]byte, 1+net.IPv6len+2)
+			addr[0] = AtypIPv6
+			copy(addr[1:], ip)
+		}
+	} else {
+		if len(host) > 255 {
+			return nil
+		}
+		addr = make([]byte, 1+1+len(host)+2)
+		addr[0] = AtypDomainName
+		addr[1] = byte(len(host))
+		copy(addr[2:], host)
+	}
+
+	portnum, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		return nil
+	}
+
+	addr[len(addr)-2], addr[len(addr)-1] = byte(portnum>>8), byte(portnum)
+
+	return addr
+}
+
+// Handshake fast-tracks SOCKS initialization to get target address to connect.
+func Handshake(rw io.ReadWriter) (Addr, error) {
+	// Read RFC 1928 for request and reply structure and sizes.
+	buf := make([]byte, MaxAddrLen)
+	// read VER, NMETHODS, METHODS
+	if _, err := io.ReadFull(rw, buf[:2]); err != nil {
+		return nil, err
+	}
+	nmethods := buf[1]
+	if _, err := io.ReadFull(rw, buf[:nmethods]); err != nil {
+		return nil, err
+	}
+	// write VER METHOD
+	if _, err := rw.Write([]byte{5, 0}); err != nil {
+		return nil, err
+	}
+	// read VER CMD RSV ATYP DST.ADDR DST.PORT
+	if _, err := io.ReadFull(rw, buf[:3]); err != nil {
+		return nil, err
+	}
+	cmd := buf[1]
+	addr, err := readAddr(rw, buf)
+	if err != nil {
+		return nil, err
+	}
+	switch cmd {
+	case CmdConnect:
+		_, err = rw.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}) // SOCKS v5, reply succeeded
+	case CmdUDPAssociate:
+		if !UDPEnabled {
+			return nil, ErrCommandNotSupported
+		}
+		listenAddr := ParseAddr(rw.(net.Conn).LocalAddr().String())
+		_, err = rw.Write(append([]byte{5, 0, 0}, listenAddr...)) // SOCKS v5, reply succeeded
+		if err != nil {
+			return nil, ErrCommandNotSupported
+		}
+		err = InfoUDPAssociate
+	default:
+		return nil, ErrCommandNotSupported
+	}
+
+	return addr, err // skip VER, CMD, RSV fields
+}
+```
+
+PATH: `./main.go`
+```go
+package main
+
+import (
+	"crypto/rand"
+	"encoding/base64"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net/url"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/shadowsocks/go-shadowsocks2/core"
+	"github.com/shadowsocks/go-shadowsocks2/socks"
+)
+
+var config struct {
+	Verbose    bool
+	UDPTimeout time.Duration
+	TCPCork    bool
+}
+
+func main() {
+
+	var flags struct {
+		Client     string
+		Server     string
+		Cipher     string
+		Key        string
+		Password   string
+		Keygen     int
+		Socks      string
+		RedirTCP   string
+		RedirTCP6  string
+		TCPTun     string
+		UDPTun     string
+		UDPSocks   bool
+		UDP        bool
+		TCP        bool
+		Plugin     string
+		PluginOpts string
+	}
+
+	flag.BoolVar(&config.Verbose, "verbose", false, "verbose mode")
+	flag.StringVar(&flags.Cipher, "cipher", "AEAD_CHACHA20_POLY1305", "available ciphers: "+strings.Join(core.ListCipher(), " "))
+	flag.StringVar(&flags.Key, "key", "", "base64url-encoded key (derive from password if empty)")
+	flag.IntVar(&flags.Keygen, "keygen", 0, "generate a base64url-encoded random key of given length in byte")
+	flag.StringVar(&flags.Password, "password", "", "password")
+	flag.StringVar(&flags.Server, "s", "", "server listen address or url")
+	flag.StringVar(&flags.Client, "c", "", "client connect address or url")
+	flag.StringVar(&flags.Socks, "socks", "", "(client-only) SOCKS listen address")
+	flag.BoolVar(&flags.UDPSocks, "u", false, "(client-only) Enable UDP support for SOCKS")
+	flag.StringVar(&flags.RedirTCP, "redir", "", "(client-only) redirect TCP from this address")
+	flag.StringVar(&flags.RedirTCP6, "redir6", "", "(client-only) redirect TCP IPv6 from this address")
+	flag.StringVar(&flags.TCPTun, "tcptun", "", "(client-only) TCP tunnel (laddr1=raddr1,laddr2=raddr2,...)")
+	flag.StringVar(&flags.UDPTun, "udptun", "", "(client-only) UDP tunnel (laddr1=raddr1,laddr2=raddr2,...)")
+	flag.StringVar(&flags.Plugin, "plugin", "", "Enable SIP003 plugin. (e.g., v2ray-plugin)")
+	flag.StringVar(&flags.PluginOpts, "plugin-opts", "", "Set SIP003 plugin options. (e.g., \"server;tls;host=mydomain.me\")")
+	flag.BoolVar(&flags.UDP, "udp", false, "(server-only) enable UDP support")
+	flag.BoolVar(&flags.TCP, "tcp", true, "(server-only) enable TCP support")
+	flag.BoolVar(&config.TCPCork, "tcpcork", false, "coalesce writing first few packets")
+	flag.DurationVar(&config.UDPTimeout, "udptimeout", 5*time.Minute, "UDP tunnel timeout")
+	flag.Parse()
+
+	if flags.Keygen > 0 {
+		key := make([]byte, flags.Keygen)
+		io.ReadFull(rand.Reader, key)
+		fmt.Println(base64.URLEncoding.EncodeToString(key))
+		return
+	}
+
+	if flags.Client == "" && flags.Server == "" {
+		flag.Usage()
+		return
+	}
+
+	var key []byte
+	if flags.Key != "" {
+		k, err := base64.URLEncoding.DecodeString(flags.Key)
+		if err != nil {
+			log.Fatal(err)
+		}
+		key = k
+	}
+
+	if flags.Client != "" { // client mode
+		addr := flags.Client
+		cipher := flags.Cipher
+		password := flags.Password
+		if flags.Password == "" {
+			password = os.Getenv("SS_PASSWORD")
+		}
+		var err error
+
+		if strings.HasPrefix(addr, "ss://") {
+			addr, cipher, password, err = parseURL(addr)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		udpAddr := addr
+
+		ciph, err := core.PickCipher(cipher, key, password)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		if flags.Plugin != "" {
+			addr, err = startPlugin(flags.Plugin, flags.PluginOpts, addr, false)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		if flags.UDPTun != "" {
+			for _, tun := range strings.Split(flags.UDPTun, ",") {
+				p := strings.Split(tun, "=")
+				go udpLocal(p[0], udpAddr, p[1], ciph.PacketConn)
+			}
+		}
+
+		if flags.TCPTun != "" {
+			for _, tun := range strings.Split(flags.TCPTun, ",") {
+				p := strings.Split(tun, "=")
+				go tcpTun(p[0], addr, p[1], ciph.StreamConn)
+			}
+		}
+
+		if flags.Socks != "" {
+			socks.UDPEnabled = flags.UDPSocks
+			go socksLocal(flags.Socks, addr, ciph.StreamConn)
+			if flags.UDPSocks {
+				go udpSocksLocal(flags.Socks, udpAddr, ciph.PacketConn)
+			}
+		}
+
+		if flags.RedirTCP != "" {
+			go redirLocal(flags.RedirTCP, addr, ciph.StreamConn)
+		}
+
+		if flags.RedirTCP6 != "" {
+			go redir6Local(flags.RedirTCP6, addr, ciph.StreamConn)
+		}
+	}
+
+	if flags.Server != "" { // server mode
+		addr := flags.Server
+		cipher := flags.Cipher
+		password := flags.Password
+		if flags.Password == "" {
+			password = os.Getenv("SS_PASSWORD")
+		}
+		var err error
+
+		if strings.HasPrefix(addr, "ss://") {
+			addr, cipher, password, err = parseURL(addr)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		udpAddr := addr
+
+		if flags.Plugin != "" {
+			addr, err = startPlugin(flags.Plugin, flags.PluginOpts, addr, true)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		ciph, err := core.PickCipher(cipher, key, password)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		if flags.UDP {
+			go udpRemote(udpAddr, ciph.PacketConn)
+		}
+		if flags.TCP {
+			go tcpRemote(addr, ciph.StreamConn)
+		}
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+	killPlugin()
+}
+
+func parseURL(s string) (addr, cipher, password string, err error) {
+	u, err := url.Parse(s)
+	if err != nil {
+		return
+	}
+
+	addr = u.Host
+	if u.User != nil {
+		cipher = u.User.Username()
+		password, _ = u.User.Password()
+	}
+	return
+}
+```
+
+PATH: `./pfutil/pf_darwin.go`
+```go
+package pfutil
+
+import (
+	"net"
+	"syscall"
+	"unsafe"
+)
+
+func NatLookup(c *net.TCPConn) (*net.TCPAddr, error) {
+	const (
+		PF_INOUT     = 0
+		PF_IN        = 1
+		PF_OUT       = 2
+		IOC_OUT      = 0x40000000
+		IOC_IN       = 0x80000000
+		IOC_INOUT    = IOC_IN | IOC_OUT
+		IOCPARM_MASK = 0x1FFF
+		LEN          = 4*16 + 4*4 + 4*1
+		// #define	_IOC(inout,group,num,len) (inout | ((len & IOCPARM_MASK) << 16) | ((group) << 8) | (num))
+		// #define	_IOWR(g,n,t)	_IOC(IOC_INOUT,	(g), (n), sizeof(t))
+		// #define DIOCNATLOOK		_IOWR('D', 23, struct pfioc_natlook)
+		DIOCNATLOOK = IOC_INOUT | ((LEN & IOCPARM_MASK) << 16) | ('D' << 8) | 23
+	)
+	fd, err := syscall.Open("/dev/pf", 0, syscall.O_RDONLY)
+	if err != nil {
+		return nil, err
+	}
+	defer syscall.Close(fd)
+	nl := struct { // struct pfioc_natlook
+		saddr, daddr, rsaddr, rdaddr       [16]byte
+		sxport, dxport, rsxport, rdxport   [4]byte
+		af, proto, protoVariant, direction uint8
+	}{
+		af:        syscall.AF_INET,
+		proto:     syscall.IPPROTO_TCP,
+		direction: PF_OUT,
+	}
+	saddr := c.RemoteAddr().(*net.TCPAddr)
+	daddr := c.LocalAddr().(*net.TCPAddr)
+	copy(nl.saddr[:], saddr.IP)
+	copy(nl.daddr[:], daddr.IP)
+	nl.sxport[0], nl.sxport[1] = byte(saddr.Port>>8), byte(saddr.Port)
+	nl.dxport[0], nl.dxport[1] = byte(daddr.Port>>8), byte(daddr.Port)
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), DIOCNATLOOK, uintptr(unsafe.Pointer(&nl))); errno != 0 {
+		return nil, errno
+	}
+	var addr net.TCPAddr
+	addr.IP = nl.rdaddr[:4]
+	addr.Port = int(nl.rdxport[0])<<8 | int(nl.rdxport[1])
+	return &addr, nil
+}
+```
+

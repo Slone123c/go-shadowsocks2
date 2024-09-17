@@ -3,23 +3,37 @@ package main
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"sync"
 	"time"
 
+	"github.com/shadowsocks/go-shadowsocks2/core"
+
 	"github.com/shadowsocks/go-shadowsocks2/socks"
 )
 
-// Create a SOCKS server listening on addr and proxy to server.
+// ServerConfig 结构体
+type ServerConfig struct {
+	Address  string `mapstructure:"address"`
+	Cipher   string `mapstructure:"cipher"`
+	Password string `mapstructure:"password"`
+}
+
+// Config 结构体
+type Config struct {
+	Servers []ServerConfig `mapstructure:"servers"`
+}
+
+// socksLocal 创建一个 SOCKS 服务器，监听 addr 地址，并将流量代理到 server。
 func socksLocal(addr, server string, shadow func(net.Conn) net.Conn) {
 	logf("SOCKS proxy %s <-> %s", addr, server)
 	tcpLocal(addr, server, shadow, func(c net.Conn) (socks.Addr, error) { return socks.Handshake(c) })
 }
 
-// Create a TCP tunnel from addr to target via server.
+// tcpTun 创建一个从 addr 到 target 的 TCP 隧道，该隧道通过 server 进行代理。
 func tcpTun(addr, server, target string, shadow func(net.Conn) net.Conn) {
 	tgt := socks.ParseAddr(target)
 	if tgt == nil {
@@ -30,7 +44,7 @@ func tcpTun(addr, server, target string, shadow func(net.Conn) net.Conn) {
 	tcpLocal(addr, server, shadow, func(net.Conn) (socks.Addr, error) { return tgt, nil })
 }
 
-// Listen on addr and proxy to server to reach target from getAddr.
+// tcpLocal 在 addr 监听，并将流量代理到 server，以到达 getAddr 返回的目标地址。
 func tcpLocal(addr, server string, shadow func(net.Conn) net.Conn, getAddr func(net.Conn) (socks.Addr, error)) {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -50,7 +64,7 @@ func tcpLocal(addr, server string, shadow func(net.Conn) net.Conn, getAddr func(
 			tgt, err := getAddr(c)
 			if err != nil {
 
-				// UDP: keep the connection until disconnect then free the UDP socket
+				// UDP: 保持连接，直到断开连接，然后释放 UDP socket
 				if err == socks.InfoUDPAssociate {
 					buf := make([]byte, 1)
 					// block here
@@ -92,7 +106,7 @@ func tcpLocal(addr, server string, shadow func(net.Conn) net.Conn, getAddr func(
 	}
 }
 
-// Listen on addr for incoming connections.
+// tcpRemote 监听 addr 地址的传入连接。
 func tcpRemote(addr string, shadow func(net.Conn) net.Conn) {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -118,31 +132,79 @@ func tcpRemote(addr string, shadow func(net.Conn) net.Conn) {
 			tgt, err := socks.ReadAddr(sc)
 			if err != nil {
 				logf("failed to get target address from %v: %v", c.RemoteAddr(), err)
-				// drain c to avoid leaking server behavioral features
-				// see https://www.ndss-symposium.org/ndss-paper/detecting-probe-resistant-proxies/
-				_, err = io.Copy(ioutil.Discard, c)
+				return
+			}
+
+			serverMutex.RLock()
+			server := currentServer
+			serverMutex.RUnlock()
+
+			for {
+				if server == nil {
+					logf("no available server")
+					return
+				}
+
+				ssRemoteAddr := server.Config.Address
+				ssCipher := server.Config.Cipher
+				ssPassword := server.Config.Password
+
+				ssCipherInst, err := core.PickCipher(ssCipher, nil, ssPassword)
 				if err != nil {
-					logf("discard error: %v", err)
+					logf("failed to create Shadowsocks cipher for %s: %v", ssRemoteAddr, err)
+					break
+				}
+
+				ssConn, err := DialWithRawAddr(ssCipherInst, ssRemoteAddr, tgt)
+				if err != nil {
+					logf("failed to connect to remote Shadowsocks server %s: %v", ssRemoteAddr, err)
+					
+					// 连接失败，重新检查所有服务器
+					for i := range serverList {
+						checkServerLatency(&serverList[i])
+					}
+					serverMutex.Lock()
+					server = selectBestServer()
+					serverMutex.Unlock()
+					continue
+				}
+				defer ssConn.Close()
+
+				logf("proxy %s <-> %s via Shadowsocks server %s", c.RemoteAddr(), tgt, ssRemoteAddr)
+
+				if err = relay(sc, ssConn); err != nil {
+					logf("relay error: %v", err)
 				}
 				return
 			}
 
-			rc, err := net.Dial("tcp", tgt.String())
-			if err != nil {
-				logf("failed to connect to target: %v", err)
-				return
-			}
-			defer rc.Close()
-
-			logf("proxy %s <-> %s", c.RemoteAddr(), tgt)
-			if err = relay(sc, rc); err != nil {
-				logf("relay error: %v", err)
-			}
+			logf("failed to connect to any configured Shadowsocks server")
 		}()
 	}
 }
 
-// relay copies between left and right bidirectionally
+// DialWithRawAddr 连接到 Shadowsocks 服务器并发送目标地址
+func DialWithRawAddr(ssCipherInst core.StreamConnCipher, remoteAddr string, rawaddr []byte) (net.Conn, error) {
+	// 先连接到 Shadowsocks 服务器
+	conn, err := net.Dial("tcp", remoteAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to remote Shadowsocks server: %v", err)
+	}
+
+	// 包装连接，应用 Shadowsocks 加密
+	ssConn := ssCipherInst.StreamConn(conn)
+
+	// 将目标地址 (rawaddr) 发送到 Shadowsocks 服务器
+	_, err = ssConn.Write(rawaddr)
+	if err != nil {
+		ssConn.Close()
+		return nil, fmt.Errorf("failed to send target address: %v", err)
+	}
+
+	return ssConn, nil
+}
+
+// relay 在 left 和 right 之间双向复制数据
 func relay(left, right net.Conn) error {
 	var err, err1 error
 	var wg sync.WaitGroup
@@ -175,6 +237,7 @@ type corkedConn struct {
 	once   sync.Once
 }
 
+// timedCork 返回一个包装了原始 Conn 的 corkedConn，它会缓冲写操作，并在指定的延迟后提交。
 func timedCork(c net.Conn, d time.Duration, bufSize int) net.Conn {
 	return &corkedConn{
 		Conn:   c,
@@ -184,6 +247,7 @@ func timedCork(c net.Conn, d time.Duration, bufSize int) net.Conn {
 	}
 }
 
+// Write 将数据写入 corkedConn。如果设置了 corked 标志，则会延迟 flush 操作。
 func (w *corkedConn) Write(p []byte) (int, error) {
 	w.lock.Lock()
 	defer w.lock.Unlock()
